@@ -1,9 +1,15 @@
-"""端到端冒烟测试（仅标准库）：覆盖受阻、畅通、跨午夜、生效期、无法判定等场景。"""
+"""端到端冒烟测试（仅标准库）：覆盖受阻、畅通、跨午夜、生效期、无法判定、
+站内迁移、跨站跳转、跳转链循环与最终地址去重等场景。"""
 import json
 import urllib.request
 
 API = "http://127.0.0.1:8000/check"
 LIST_URL = "http://127.0.0.1:8080/announcements?page=1"
+MOVED_LIST_URL = "http://127.0.0.1:8080/moved/announcements"  # 站内迁移（302 到新目录）
+MIXED_LIST_URL = "http://127.0.0.1:8080/mixed/announcements"  # 同一公告新旧地址重复
+MIRROR_LIST_URL = "http://127.0.0.1:8080/mirror/announcements"  # 跨站跳转
+REMOTE_LIST_URL = "http://127.0.0.1:8080/remote/announcements"  # 详情跨站跳转
+LOOP_LIST_URL = "http://127.0.0.1:8080/loop/announcements"  # 跳转链循环
 
 
 def call(segments, list_url=LIST_URL):
@@ -102,5 +108,61 @@ d9 = show("UTC 输入自动换算北京时间", call([
 assert any(b["road_id"] == "G15-K123" for b in d9["blocked"])
 hit9 = next(b for b in d9["blocked"] if b["road_id"] == "G15-K123")
 assert hit9["blocking"][0]["start"] == "2026-11-16T22:00:00+08:00"
+
+# 10. 站内迁移：旧目录 302 到新目录，相对链接按最终页面地址解析，可正常判定
+d10 = show("站内目录迁移（旧地址 302 -> 新目录，相对链接）", call([
+    {"road_id": "G15-K123", "direction": "下行",
+     "enter_at": "2026-11-16T21:30:00+08:00", "exit_at": "2026-11-17T02:00:00+08:00"},
+    {"road_id": "G15-K123", "direction": "上行",
+     "enter_at": "2026-11-18T10:00:00+08:00", "exit_at": "2026-11-18T12:00:00+08:00"},
+], list_url=MOVED_LIST_URL))
+assert d10["status"] == "blocked", f"迁移目录无采集失败，应为 blocked: {d10['failures']}"
+assert d10["failures"] == []
+assert d10["fetched_announcements"] == 3
+hit10 = next(b for b in d10["blocked"] if b["road_id"] == "G15-K123")
+# 命中的公告链接应是跳转后的最终地址
+assert hit10["announcements"][0].endswith("/bulletin/announcement/gg-2026-001")
+# 无失效链接时，未受阻路段可以报畅通
+assert any(c["road_id"] == "G15-K123" and c["direction"] == "上行" for c in d10["clear"])
+
+# 11. 跨站跳转（列表）：拒绝跟随，记录问题地址，未核实路段不得报畅通
+d11 = show("列表跨站跳转 -> 无法判定", call([
+    {"road_id": "G15-K123", "direction": "下行",
+     "enter_at": "2026-11-16T21:30:00+08:00", "exit_at": "2026-11-17T02:00:00+08:00"},
+], list_url=MIRROR_LIST_URL))
+assert d11["status"] == "undetermined"
+assert d11["clear"] == [] and d11["blocked"] == []
+assert any(f["stage"] == "list" and "跨站" in f["reason"] for f in d11["failures"])
+assert any(f["url"].startswith(MIRROR_LIST_URL) for f in d11["failures"])
+
+# 12. 跨站跳转（详情）：列表在本站，详情跳别站 -> 记录 detail 失败
+d12 = show("详情跨站跳转 -> 无法判定", call([
+    {"road_id": "S1-K5", "direction": "上行",
+     "enter_at": "2026-11-16T10:00:00+08:00", "exit_at": "2026-11-16T12:00:00+08:00"},
+], list_url=REMOTE_LIST_URL))
+assert d12["status"] == "undetermined"
+assert d12["clear"] == []
+assert any(f["stage"] == "detail" and "跨站" in f["reason"] for f in d12["failures"])
+
+# 13. 跳转链循环：自跳转 -> 记录 list 失败
+d13 = show("跳转链循环 -> 无法判定", call([
+    {"road_id": "G15-K123", "direction": "下行",
+     "enter_at": "2026-11-16T21:30:00+08:00", "exit_at": "2026-11-17T02:00:00+08:00"},
+], list_url=LOOP_LIST_URL))
+assert d13["status"] == "undetermined"
+assert d13["clear"] == []
+assert any(f["stage"] == "list" and "循环" in f["reason"] for f in d13["failures"])
+
+# 14. 最终地址去重：同一公告经新地址与旧跳转地址出现两次，只采集一次
+d14 = show("同一公告新旧地址重复 -> 按最终地址去重", call([
+    {"road_id": "G15-K123", "direction": "下行",
+     "enter_at": "2026-11-16T21:30:00+08:00", "exit_at": "2026-11-17T02:00:00+08:00"},
+], list_url=MIXED_LIST_URL))
+assert d14["status"] == "blocked", f"无采集失败，应为 blocked: {d14['failures']}"
+assert d14["fetched_announcements"] == 1
+hit14 = next(b for b in d14["blocked"] if b["road_id"] == "G15-K123")
+assert hit14["announcements"] == [
+    "http://127.0.0.1:8080/bulletin/announcement/gg-2026-001"
+]
 
 print("全部断言通过 ✔")
